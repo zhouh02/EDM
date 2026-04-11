@@ -98,6 +98,10 @@ class CIM(nn.Module):
 
         self.loftr_32 = LocalFeatureTransformer(config["neck"])
 
+        config_neck_16 = dict(config["neck"])
+        config_neck_16["mask_ds_steps"] = 1
+        self.loftr_16 = LocalFeatureTransformer(config_neck_16)
+
     def forward(self, ms_feats, mask_c0=None, mask_c1=None):
         if len(ms_feats) == 3:  # same image shape
             f8, f16, f32 = ms_feats
@@ -112,6 +116,11 @@ class CIM(nn.Module):
                 f32), scale_factor=2.0, mode="bilinear")
             f16 = self.fc16(f16)
             f16 = self.dwconv16(f16 * att32_up + f32_up)
+
+            f16_0, f16_1 = f16.chunk(2, dim=0)
+            f16_0, f16_1 = self.loftr_16(f16_0, f16_1, mask_c0, mask_c1)
+            f16 = torch.cat([f16_0, f16_1], dim=0)
+
             f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
             att16_up = F.interpolate(self.att16(
                 f16), scale_factor=2.0, mode="bilinear")
@@ -127,29 +136,36 @@ class CIM(nn.Module):
 
             f32_0, f32_1 = self.loftr_32(f32_0, f32_1, mask_c0, mask_c1)
 
-            f8, f16, f32 = f8_0, f16_0, f32_0
-            f32_up = F.interpolate(f32, scale_factor=2.0, mode="bilinear")
+            # Fuse 1/32 -> 1/16 for image0
+            f32_up = F.interpolate(f32_0, scale_factor=2.0, mode="bilinear")
             att32_up = F.interpolate(self.att32(
-                f32), scale_factor=2.0, mode="bilinear")
-            f16 = self.fc16(f16)
-            f16 = self.dwconv16(f16 * att32_up + f32_up)
-            f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
+                f32_0), scale_factor=2.0, mode="bilinear")
+            f16_0 = self.fc16(f16_0)
+            f16_0 = self.dwconv16(f16_0 * att32_up + f32_up)
+
+            # Fuse 1/32 -> 1/16 for image1
+            f32_up = F.interpolate(f32_1, scale_factor=2.0, mode="bilinear")
+            att32_up = F.interpolate(self.att32(
+                f32_1), scale_factor=2.0, mode="bilinear")
+            f16_1 = self.fc16(f16_1)
+            f16_1 = self.dwconv16(f16_1 * att32_up + f32_up)
+
+            # 1/16 scale self+cross attention
+            f16_0, f16_1 = self.loftr_16(f16_0, f16_1, mask_c0, mask_c1)
+
+            # Fuse 1/16 -> 1/8 for image0
+            f16_up = F.interpolate(f16_0, scale_factor=2.0, mode="bilinear")
             att16_up = F.interpolate(self.att16(
-                f16), scale_factor=2.0, mode="bilinear")
-            f8 = self.fc8(f8)
+                f16_0), scale_factor=2.0, mode="bilinear")
+            f8 = self.fc8(f8_0)
             f8 = self.dwconv8(f8 * att16_up + f16_up)
             feat_c0 = f8
 
-            f8, f16, f32 = f8_1, f16_1, f32_1
-            f32_up = F.interpolate(f32, scale_factor=2.0, mode="bilinear")
-            att32_up = F.interpolate(self.att32(
-                f32), scale_factor=2.0, mode="bilinear")
-            f16 = self.fc16(f16)
-            f16 = self.dwconv16(f16 * att32_up + f32_up)
-            f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
+            # Fuse 1/16 -> 1/8 for image1
+            f16_up = F.interpolate(f16_1, scale_factor=2.0, mode="bilinear")
             att16_up = F.interpolate(self.att16(
-                f16), scale_factor=2.0, mode="bilinear")
-            f8 = self.fc8(f8)
+                f16_1), scale_factor=2.0, mode="bilinear")
+            f8 = self.fc8(f8_1)
             f8 = self.dwconv8(f8 * att16_up + f16_up)
             feat_c1 = f8
 
