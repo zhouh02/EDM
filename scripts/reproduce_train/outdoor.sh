@@ -12,9 +12,9 @@ data_cfg_path="configs/data/megadepth_trainval_${TRAIN_IMG_SIZE}.py"
 main_cfg_path="configs/edm/outdoor/edm_base.py"
 
 n_nodes=1
-n_gpus_per_node=8
-torch_num_workers=8
-batch_size=4
+n_gpus_per_node=3
+torch_num_workers=12
+batch_size=3
 pin_memory=true
 exp_name="edm_outdoor"
 ckpt=""

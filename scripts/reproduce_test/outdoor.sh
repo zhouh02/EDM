@@ -13,10 +13,10 @@ dump_dir="dump/edm_outdoor"
 profiler_name="inference"
 n_nodes=1
 n_gpus_per_node=1
-torch_num_workers=8
-batch_size=1
+torch_num_workers=12
+batch_size=3
 
-ckpt_path="weights/edm_outdoor.ckpt"
+ckpt_path="/ssd-data3/zh2025/EDM/weights/edm_outdoor.ckpt"
 size=1152 # follow ELoFTR's setting
 
 python -u ./test.py \
