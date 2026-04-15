@@ -27,6 +27,7 @@ _CN.EDM.NECK.AGG_SIZE0 = 1
 _CN.EDM.NECK.AGG_SIZE1 = 1
 _CN.EDM.NECK.ROPE = True
 _CN.EDM.NECK.NPE = None
+_CN.EDM.NECK.MASK_DS_STEPS = 2  # mask downsample steps (loftr_32: 2, loftr_16: 1)
 
 # 3. Coarse-Matching config
 _CN.EDM.COARSE = CN()

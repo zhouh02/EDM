@@ -97,6 +97,10 @@ class CIM(nn.Module):
         )
 
         self.loftr_32 = LocalFeatureTransformer(config["neck"])
+        # loftr_16 at 1/16 scale: mask only needs 1 downsample step (vs 2 for 1/32)
+        config_neck_16 = dict(config["neck"])
+        config_neck_16["mask_ds_steps"] = 1
+        self.loftr_16 = LocalFeatureTransformer(config_neck_16)
 
     def forward(self, ms_feats, mask_c0=None, mask_c1=None):
         if len(ms_feats) == 3:  # same image shape
@@ -112,6 +116,11 @@ class CIM(nn.Module):
                 f32), scale_factor=2.0, mode="bilinear")
             f16 = self.fc16(f16)
             f16 = self.dwconv16(f16 * att32_up + f32_up)
+            # ---- 1/16 尺度 LoFTR 注意力（新增）----
+            f16_0, f16_1 = f16.chunk(2, dim=0)
+            f16_0, f16_1 = self.loftr_16(f16_0, f16_1, mask_c0, mask_c1)
+            f16 = torch.cat([f16_0, f16_1], dim=0)
+            # ----------------------------------------
             f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
             att16_up = F.interpolate(self.att16(
                 f16), scale_factor=2.0, mode="bilinear")
@@ -133,6 +142,11 @@ class CIM(nn.Module):
                 f32), scale_factor=2.0, mode="bilinear")
             f16 = self.fc16(f16)
             f16 = self.dwconv16(f16 * att32_up + f32_up)
+            # ---- 1/16 尺度 LoFTR 注意力（新增）----
+            f16_0_t, f16_1_t = f16.chunk(2, dim=0)
+            f16_0_t, f16_1_t = self.loftr_16(f16_0_t, f16_1_t, mask_c0, mask_c1)
+            f16 = torch.cat([f16_0_t, f16_1_t], dim=0)
+            # ----------------------------------------
             f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
             att16_up = F.interpolate(self.att16(
                 f16), scale_factor=2.0, mode="bilinear")
@@ -146,6 +160,11 @@ class CIM(nn.Module):
                 f32), scale_factor=2.0, mode="bilinear")
             f16 = self.fc16(f16)
             f16 = self.dwconv16(f16 * att32_up + f32_up)
+            # ---- 1/16 尺度 LoFTR 注意力（新增）----
+            f16_0_t, f16_1_t = f16.chunk(2, dim=0)
+            f16_0_t, f16_1_t = self.loftr_16(f16_0_t, f16_1_t, mask_c0, mask_c1)
+            f16 = torch.cat([f16_0_t, f16_1_t], dim=0)
+            # ----------------------------------------
             f16_up = F.interpolate(f16, scale_factor=2.0, mode="bilinear")
             att16_up = F.interpolate(self.att16(
                 f16), scale_factor=2.0, mode="bilinear")

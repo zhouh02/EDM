@@ -244,12 +244,14 @@ class AG_RoPE_EncoderLayer(nn.Module):
         agg_size1=2,
         rope=False,
         npe=None,
+        mask_ds_steps=2,
     ):
         super(AG_RoPE_EncoderLayer, self).__init__()
         self.dim = d_model // nhead
         self.nhead = nhead
         self.agg_size0, self.agg_size1 = agg_size0, agg_size1
         self.rope = rope
+        self.mask_ds_steps = mask_ds_steps
 
         # aggregate and position encoding
         self.aggregate = (
@@ -312,12 +314,10 @@ class AG_RoPE_EncoderLayer(nn.Module):
             self.max_pool(source).permute(0, 2, 3, 1)
         )  # [N, H, W, C]
         if x_mask is not None:
-            # mask 1/8 to 1/32
-            x_mask, source_mask = map(
-                lambda x: self.mask_max_pool(
-                    self.mask_max_pool(x.float())).bool(),
-                [x_mask, source_mask],
-            )
+            # mask downsample: loftr_32(1/32) needs 2 steps, loftr_16(1/16) needs 1 step
+            for _ in range(self.mask_ds_steps):
+                x_mask = self.mask_max_pool(x_mask.float()).bool()
+                source_mask = self.mask_max_pool(source_mask.float()).bool()
         query, key, value = self.q_proj(
             query), self.k_proj(source), self.v_proj(source)
 
@@ -362,6 +362,7 @@ class LocalFeatureTransformer(nn.Module):
         self.layer_names = config["layer_names"]
         self.agg_size0, self.agg_size1 = config["agg_size0"], config["agg_size1"]
         self.rope = config["rope"]
+        self.mask_ds_steps = config.get("mask_ds_steps", 2)
 
         self_layer = AG_RoPE_EncoderLayer(
             config["d_model"],
@@ -370,6 +371,7 @@ class LocalFeatureTransformer(nn.Module):
             config["agg_size1"],
             config["rope"],
             config["npe"],
+            self.mask_ds_steps,
         )
         cross_layer = AG_RoPE_EncoderLayer(
             config["d_model"],
@@ -378,6 +380,7 @@ class LocalFeatureTransformer(nn.Module):
             config["agg_size1"],
             False,
             config["npe"],
+            self.mask_ds_steps,
         )
 
         self.layers = nn.ModuleList(
