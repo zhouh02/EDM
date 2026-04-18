@@ -179,10 +179,24 @@ def spvs_covisibility(data, config):
     )
     grid_pt1_i = scale1 * grid_pt1_c
 
-    # Mask padded regions: 复用 mask_pts_at_padded_regions
+    # Mask padded regions: downsample mask to 1/32 before passing to mask_pts_at_padded_regions
+    # data["mask0"]/["mask1"] are at 1/8 resolution (coarse scale), need 1/32
     if "mask0" in data:
-        grid_pt0_i = mask_pts_at_padded_regions(grid_pt0_i, data["mask0"])
-        grid_pt1_i = mask_pts_at_padded_regions(grid_pt1_i, data["mask1"])
+        _m0 = data["mask0"]
+        if _m0.ndim == 4:
+            _m0 = _m0.squeeze(1)
+        mask0_32 = F.interpolate(
+            _m0[:, None].float(), size=(h0_32, w0_32),
+            mode='nearest').squeeze(1).bool()
+        _m1 = data["mask1"]
+        if _m1.ndim == 4:
+            _m1 = _m1.squeeze(1)
+        mask1_32 = F.interpolate(
+            _m1[:, None].float(), size=(h1_32, w1_32),
+            mode='nearest').squeeze(1).bool()
+        # mask_pts_at_padded_regions expects [N, H, W] mask
+        grid_pt0_i = mask_pts_at_padded_regions(grid_pt0_i, mask0_32)
+        grid_pt1_i = mask_pts_at_padded_regions(grid_pt1_i, mask1_32)
 
     # valid_mask = nonzero_depth & in_bounds & depth_consistent
     valid_mask_0, _ = warp_kpts(
@@ -197,14 +211,8 @@ def spvs_covisibility(data, config):
 
     # 显式将 padded region 的 covi_gt 置 0
     if "mask0" in data:
-        mask0_32 = F.interpolate(
-            data["mask0"][:, None].float(), size=(h0_32, w0_32),
-            mode='nearest').squeeze(1).bool()
-        mask1_32 = F.interpolate(
-            data["mask1"][:, None].float(), size=(h1_32, w1_32),
-            mode='nearest').squeeze(1).bool()
-        covi_gt_0[~mask0_32] = 0.0
-        covi_gt_1[~mask1_32] = 0.0
+        covi_gt_0 = covi_gt_0 * mask0_32.unsqueeze(1).float()
+        covi_gt_1 = covi_gt_1 * mask1_32.unsqueeze(1).float()
 
     data.update({"covi_gt_0": covi_gt_0, "covi_gt_1": covi_gt_1})
 
@@ -216,7 +224,8 @@ def compute_supervision_coarse(data, config):
     data_source = data["dataset_name"][0]
     if data_source.lower() in ["scannet", "megadepth"]:
         spvs_coarse(data, config)
-        spvs_covisibility(data, config)
+        if config["edm"]["neck"]["covi_enabled"]:
+            spvs_covisibility(data, config)
     else:
         raise ValueError(f"Unknown data source: {data_source}")
 
