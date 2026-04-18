@@ -71,7 +71,7 @@ class EDM(nn.Module):
             mask_c0, mask_c1 = data["mask0"], data["mask1"]
 
         # 2.  Feature Interaction & Multi-Scale Fusion
-        feat_c0, feat_c1 = self.neck(ms_feats, mask_c0, mask_c1)
+        feat_c0, feat_c1, covi_data = self.neck(ms_feats, mask_c0, mask_c1)
 
         data.update(
             {
@@ -81,6 +81,8 @@ class EDM(nn.Module):
                 "hw1_f": feat_c1.shape[2:] * self.config["local_resolution"],
             }
         )
+        if covi_data is not None:
+            data.update(covi_data)
         feat_c0 = rearrange(feat_c0, "n c h w -> n (h w) c")
         feat_c1 = rearrange(feat_c1, "n c h w -> n (h w) c")
         feat_f0 = rearrange(feat_f0, "n c h w -> n (h w) c")

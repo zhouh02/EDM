@@ -2,6 +2,7 @@ from math import log
 from loguru import logger
 
 import torch
+import torch.nn.functional as F
 from einops import repeat
 from kornia.utils import create_meshgrid
 
@@ -139,6 +140,75 @@ def spvs_coarse(data, config):
     )
 
 
+@torch.no_grad()
+def spvs_covisibility(data, config):
+    """
+    Compute covisibility GT maps at 1/32 resolution.
+    Uses the same coordinate convention as spvs_coarse:
+    create_meshgrid(normalized=False) * scale0/scale1.
+    Valid mask from warp_kpts includes:
+    nonzero depth + in-bounds + depth consistency < 0.2.
+    Padded regions are explicitly zeroed out.
+
+    Updates data with:
+        "covi_gt_0": [N, 1, H0/32, W0/32]  (float, 0.0 or 1.0)
+        "covi_gt_1": [N, 1, H1/32, W1/32]  (float, 0.0 or 1.0)
+    """
+    device = data["image0"].device
+    N = data["image0"].size(0)
+    _, _, H0, W0 = data["image0"].shape
+    _, _, H1, W1 = data["image1"].shape
+    scale = 32  # 1/32 resolution
+
+    # 复用 spvs_coarse 的 scale0/scale1 处理范式
+    scale0 = scale * data["scale0"][:, None] if "scale0" in data else scale
+    scale1 = scale * data["scale1"][:, None] if "scale0" in data else scale
+
+    h0_32, w0_32 = H0 // scale, W0 // scale
+    h1_32, w1_32 = H1 // scale, W1 // scale
+
+    # Grid: 与 spvs_coarse 完全一致的坐标约定
+    grid_pt0_c = (
+        create_meshgrid(h0_32, w0_32, False, device).reshape(
+            1, h0_32 * w0_32, 2).repeat(N, 1, 1)
+    )
+    grid_pt0_i = scale0 * grid_pt0_c
+    grid_pt1_c = (
+        create_meshgrid(h1_32, w1_32, False, device).reshape(
+            1, h1_32 * w1_32, 2).repeat(N, 1, 1)
+    )
+    grid_pt1_i = scale1 * grid_pt1_c
+
+    # Mask padded regions: 复用 mask_pts_at_padded_regions
+    if "mask0" in data:
+        grid_pt0_i = mask_pts_at_padded_regions(grid_pt0_i, data["mask0"])
+        grid_pt1_i = mask_pts_at_padded_regions(grid_pt1_i, data["mask1"])
+
+    # valid_mask = nonzero_depth & in_bounds & depth_consistent
+    valid_mask_0, _ = warp_kpts(
+        grid_pt0_i, data["depth0"], data["depth1"],
+        data["T_0to1"], data["K0"], data["K1"])
+    valid_mask_1, _ = warp_kpts(
+        grid_pt1_i, data["depth1"], data["depth0"],
+        data["T_1to0"], data["K1"], data["K0"])
+
+    covi_gt_0 = valid_mask_0.reshape(N, 1, h0_32, w0_32).float()
+    covi_gt_1 = valid_mask_1.reshape(N, 1, h1_32, w1_32).float()
+
+    # 显式将 padded region 的 covi_gt 置 0
+    if "mask0" in data:
+        mask0_32 = F.interpolate(
+            data["mask0"][:, None].float(), size=(h0_32, w0_32),
+            mode='nearest').squeeze(1).bool()
+        mask1_32 = F.interpolate(
+            data["mask1"][:, None].float(), size=(h1_32, w1_32),
+            mode='nearest').squeeze(1).bool()
+        covi_gt_0[~mask0_32] = 0.0
+        covi_gt_1[~mask1_32] = 0.0
+
+    data.update({"covi_gt_0": covi_gt_0, "covi_gt_1": covi_gt_1})
+
+
 def compute_supervision_coarse(data, config):
     assert (
         len(set(data["dataset_name"])) == 1
@@ -146,6 +216,7 @@ def compute_supervision_coarse(data, config):
     data_source = data["dataset_name"][0]
     if data_source.lower() in ["scannet", "megadepth"]:
         spvs_coarse(data, config)
+        spvs_covisibility(data, config)
     else:
         raise ValueError(f"Unknown data source: {data_source}")
 

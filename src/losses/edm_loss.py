@@ -20,6 +20,8 @@ class EDMLoss(nn.Module):
         self.c_neg_w = self.loss_config["neg_weight"]
         # fine-level
         self.q_distribution = self.loss_config["q_distribution"]
+        # covisibility
+        self.covi_weight = self.loss_config["covi_weight"]
         # self.fine_type = self.loss_config["fine_type"]
         # self.fine_loss = [nn.L1Loss(), nn.MSELoss(), nn.SmoothL1Loss()][1]
 
@@ -185,6 +187,18 @@ class EDMLoss(nn.Module):
         )
         loss = loss_c * self.loss_config["coarse_weight"]
         loss_scalars.update({"loss_c": loss_c.clone().detach().cpu()})
+
+        # 1.5 covisibility loss
+        if "covi_logits_0" in data and "covi_gt_0" in data:
+            loss_covi = (
+                F.binary_cross_entropy_with_logits(
+                    data["covi_logits_0"], data["covi_gt_0"], reduction='mean')
+                + F.binary_cross_entropy_with_logits(
+                    data["covi_logits_1"], data["covi_gt_1"], reduction='mean')
+            ) / 2.0
+            loss += loss_covi * self.covi_weight
+            loss_scalars.update(
+                {"loss_covi": loss_covi.clone().detach().cpu()})
 
         # 2. fine-level loss
         loss_f = self.compute_rle_loss(

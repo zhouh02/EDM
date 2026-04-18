@@ -27,6 +27,7 @@ _CN.EDM.NECK.AGG_SIZE0 = 1
 _CN.EDM.NECK.AGG_SIZE1 = 1
 _CN.EDM.NECK.ROPE = True
 _CN.EDM.NECK.NPE = None
+_CN.EDM.NECK.COVI_ENABLED = True  # enable covisibility branch
 
 # 3. Coarse-Matching config
 _CN.EDM.COARSE = CN()
@@ -63,6 +64,7 @@ _CN.EDM.LOSS.NEG_WEIGHT = 1.0
 _CN.EDM.LOSS.FINE_TYPE = "rle"
 _CN.EDM.LOSS.FINE_WEIGHT = 0.2
 _CN.EDM.LOSS.Q_DISTRIBUTION = "laplace"  # options: ['laplace', 'gaussian']
+_CN.EDM.LOSS.COVI_WEIGHT = 0.1  # covisibility supervision loss weight
 
 
 ##############  Dataset  ##############
