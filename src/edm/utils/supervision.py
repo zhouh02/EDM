@@ -224,7 +224,7 @@ def compute_supervision_coarse(data, config):
     data_source = data["dataset_name"][0]
     if data_source.lower() in ["scannet", "megadepth"]:
         spvs_coarse(data, config)
-        if config["edm"]["neck"]["covi_enabled"]:
+        if config["EDM"]["NECK"]["COVI_ENABLED"]:
             spvs_covisibility(data, config)
     else:
         raise ValueError(f"Unknown data source: {data_source}")
