@@ -45,6 +45,7 @@ class PL_EDM(pl.LightningModule):
         # Matcher: EDM
         self.matcher = EDM(config=_config["edm"])
         self.loss = EDMLoss(_config)
+        logger.info(f"Covisibility branch: {'ENABLED' if config.EDM.NECK.COVI_ENABLED else 'DISABLED (baseline mode)')}")
 
         # Pretrained weights
         if pretrained_ckpt:
