@@ -22,12 +22,33 @@ _CN.EDM.BACKBONE.BLOCK_DIMS = [32, 64, 128, 256, 256]  # 1/2 -> 1/32
 _CN.EDM.NECK = CN()
 _CN.EDM.NECK.D_MODEL = 256
 _CN.EDM.NECK.NHEAD = 8
-_CN.EDM.NECK.LAYER_NAMES = ["self", "cross"] * 2
-_CN.EDM.NECK.AGG_SIZE0 = 1
-_CN.EDM.NECK.AGG_SIZE1 = 1
+# DCAT: 4-stage transformer with predictor-feedback mechanism
+# CoMatch's DCAT uses 1/8 scale, EDM's coarse stage is 1/32
+# AGG_SIZE=4 in CoMatch corresponds to ~32 pixels at 1/8
+# At 1/32 scale, default AGG_SIZE=2 to maintain non-degenerate local aggregation
+# while avoiding too large spatial receptive field
+_CN.EDM.NECK.LAYER_NAMES = ["self", "cross"] * 4  # 8 layers: 4 self-cross stages
+_CN.EDM.NECK.AGG_SIZE0 = 2  # aggregation window size for query (query resolution)
+_CN.EDM.NECK.AGG_SIZE1 = 2  # aggregation window size for key/value (source resolution)
 _CN.EDM.NECK.ROPE = True
 _CN.EDM.NECK.NPE = None
-_CN.EDM.NECK.COVI_ENABLED = True  # enable covisibility branch
+
+# --- DCAT (Dynamic Covisibility-Aware Transformer) Config ---
+# This replaces the legacy external covi_head + _fuse_gate mechanism
+# CoMatch alignment: 8-layer transformer with 3 predictor outputs (cross i=1,3,5)
+_CN.EDM.NECK.DCAT = CN()
+_CN.EDM.NECK.DCAT.ENABLED = True  # enable full DCAT mechanism
+_CN.EDM.NECK.DCAT.NUM_STAGES = 3  # number of predictor outputs (cross i=1,3,5); cross i=7 does not predict
+_CN.EDM.NECK.DCAT.PREDICTOR_DIM = 256  # predictor input channel (same as d_model)
+_CN.EDM.NECK.DCAT.USE_FOCAL_LOSS = True  # use focal loss for covisibility supervision
+_CN.EDM.NECK.DCAT.FOCAL_ALPHA = 0.25
+_CN.EDM.NECK.DCAT.FOCAL_GAMMA = 2.0
+_CN.EDM.NECK.DCAT.SUPERVISE_ALL_STAGES = True  # supervise all 3 stage predictor outputs
+_CN.EDM.NECK.DCAT.DISABLE_LEGACY_FUSE_GATE = True  # disable old external gating mechanism
+_CN.EDM.NECK.DCAT.DETACH_FEEDBACK = False  # keep gradients in feedback loop
+
+# Legacy covisibility branch (deprecated when DCAT.ENABLED=True)
+_CN.EDM.NECK.COVI_ENABLED = False  # use DCAT instead
 
 # 3. Coarse-Matching config
 _CN.EDM.COARSE = CN()
@@ -65,6 +86,9 @@ _CN.EDM.LOSS.FINE_TYPE = "rle"
 _CN.EDM.LOSS.FINE_WEIGHT = 0.2
 _CN.EDM.LOSS.Q_DISTRIBUTION = "laplace"  # options: ['laplace', 'gaussian']
 _CN.EDM.LOSS.COVI_WEIGHT = 0.1  # covisibility supervision loss weight
+_CN.EDM.LOSS.COVI_FOCAL_ALPHA = 0.25  # focal loss alpha for covisibility
+_CN.EDM.LOSS.COVI_FOCAL_GAMMA = 2.0  # focal loss gamma for covisibility
+_CN.EDM.LOSS.COVI_MULTI_STAGE_AVG = True  # average loss across all 4 stages
 
 
 ##############  Dataset  ##############

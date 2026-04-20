@@ -224,7 +224,10 @@ def compute_supervision_coarse(data, config):
     data_source = data["dataset_name"][0]
     if data_source.lower() in ["scannet", "megadepth"]:
         spvs_coarse(data, config)
-        if config["EDM"]["NECK"]["COVI_ENABLED"]:
+        # Generate covisibility GT when either legacy COVI or DCAT is enabled
+        dcat_enabled = config["EDM"]["NECK"]["DCAT"]["ENABLED"]
+        legacy_covi_enabled = config["EDM"]["NECK"]["COVI_ENABLED"]
+        if dcat_enabled or legacy_covi_enabled:
             spvs_covisibility(data, config)
     else:
         raise ValueError(f"Unknown data source: {data_source}")
