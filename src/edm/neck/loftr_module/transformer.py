@@ -234,6 +234,71 @@ class Attention(Module):
             m = torch.cat(m_list, dim=0)
         return m
 
+    def forward_mixed_res(self, query, key, value, q_mask=None, kv_mask=None):
+        """
+        Mixed-resolution attention for DCAT: supports Lq != Lkv.
+
+        Args:
+            query: [B, Hq, Wq, C] - query at original resolution
+            key:   [B, Hk, Wk, C] - key at aggregated low resolution
+            value: [B, Hk, Wk, C] - value at aggregated low resolution
+            q_mask:  [B, Hq, Wq] or None - valid mask for query
+            kv_mask: [B, Hk, Wk] or None - valid mask for key/value
+
+        Returns:
+            out: [B, Hq, Wq, nhead*dim] - output at query resolution
+        """
+        B = query.size(0)
+        Hq, Wq = query.size(1), query.size(2)
+        Hk, Wk = key.size(1), key.size(2)
+        Lq = Hq * Wq
+        Lk = Hk * Wk
+
+        # Flatten spatial dims: [B, H, W, C] -> [B, L, nhead, dim]
+        q = rearrange(query, "n h w (nhead d) -> n (h w) nhead d",
+                      nhead=self.nhead, d=self.dim)  # [B, Lq, nhead, dim]
+        k = rearrange(key,   "n h w (nhead d) -> n (h w) nhead d",
+                      nhead=self.nhead, d=self.dim)  # [B, Lk, nhead, dim]
+        v = rearrange(value, "n h w (nhead d) -> n (h w) nhead d",
+                      nhead=self.nhead, d=self.dim)  # [B, Lk, nhead, dim]
+
+        # Scaled Cosine Attention
+        q = F.normalize(q, p=2, dim=3)
+        k = F.normalize(k, p=2, dim=3)
+        # QK: [B, nhead, Lq, Lk] via einsum
+        QK = torch.einsum("nlhd,nshd->nhls", q, k)  # [B, nhead, Lq, Lk]
+        s = 20.0
+
+        # Apply mask before softmax
+        if q_mask is not None or kv_mask is not None:
+            # ASSERT: mask spatial dims must match corresponding tensor
+            if q_mask is not None:
+                assert q_mask.shape == (B, Hq, Wq), (
+                    f"[mixed_res] q_mask shape {q_mask.shape} != query spatial ({B}, {Hq}, {Wq})"
+                )
+            if kv_mask is not None:
+                assert kv_mask.shape == (B, Hk, Wk), (
+                    f"[mixed_res] kv_mask shape {kv_mask.shape} != key spatial ({B}, {Hk}, {Wk})"
+                )
+            # Build additive mask: -inf for invalid positions
+            mask = torch.zeros(B, 1, Lq, Lk, device=query.device, dtype=query.dtype)
+            if q_mask is not None:
+                # q_mask: [B, Hq, Wq] -> [B, 1, Lq, 1]
+                qm = q_mask.reshape(B, 1, Lq, 1)
+                mask = mask.masked_fill(~qm, float("-inf"))
+            if kv_mask is not None:
+                # kv_mask: [B, Hk, Wk] -> [B, 1, 1, Lk]
+                kvm = kv_mask.reshape(B, 1, 1, Lk)
+                mask = mask.masked_fill(~kvm, float("-inf"))
+            A = torch.softmax(s * QK + mask, dim=3)
+        else:
+            A = torch.softmax(s * QK, dim=3)  # [B, nhead, Lq, Lk]
+
+        # Weighted sum: [B, nhead, Lq, Lk] x [B, Lk, nhead, dim] -> [B, Lq, nhead, dim]
+        out = torch.einsum("nhls,nshd->nlhd", A, v)  # [B, Lq, nhead, dim]
+
+        return out
+
 
 # ============================================
 # Helper Functions for DCAT
@@ -264,10 +329,13 @@ def _dynamic_aggregate_with_matchability(
     nhead,
     k_proj,
     v_proj,
+    source_mask=None,
 ):
     """
     Dynamic aggregation with matchability-guided weighting.
     This implements the core of CoMatch's Dynamic Covisibility-Aware Aggregation.
+
+    IMPORTANT: This function now returns TRUE low-res kv (no interpolation back to query resolution).
 
     Args:
         x: [B, C, Hx, Wx] - query feature map
@@ -281,33 +349,43 @@ def _dynamic_aggregate_with_matchability(
         nhead: number of attention heads
         k_proj: Linear projection for keys
         v_proj: Linear projection for values
+        source_mask: [B, Hs, Ws] or None - valid mask for source features
 
     Returns:
-        pooled_key: [B, Hx*Wx, C] - aggregated and projected keys
-        pooled_value: [B, Hx*Wx, C] - aggregated and projected values (weighted by pooled matchability)
-        pooled_source_score: [B, 1, Hx, Wx] - pooled source matchability scores (for later weighting)
+        pooled_key_4d: [B, Hk, Wk, C] - aggregated and projected keys (TRUE low-res, NOT upsampled)
+        pooled_value_4d: [B, Hk, Wk, C] - aggregated and projected values
+        pooled_source_score: [B, 1, Hk, Wk] - max-pooled source matchability scores (low-res)
+        kv_mask: [B, Hk, Wk] or None - valid mask for kv (pooled from source_mask via max pooling)
     """
     B, C, Hx, Wx = x.shape
     Hs, Ws = source_hw
     Hx, Wx = int(Hx), int(Wx)
     Hs, Ws = int(Hs), int(Ws)
 
-    # Determine effective aggregation size (handle small feature maps)
-    effective_agg_h = min(agg_size, Hx) if Hx > 0 else 1
-    effective_agg_w = min(agg_size, Wx) if Wx > 0 else 1
-
-    # Fallback to no aggregation if feature map is too small
-    if Hx < effective_agg_h or Ws < effective_agg_w:
-        # Return simple projection without aggregation
-        source_proj = v_proj(source.permute(0, 2, 3, 1)).reshape(B, C, Hx * Wx).transpose(1, 2)
-        return (
-            x.reshape(B, C, Hx * Wx).transpose(1, 2),
-            source_proj,
-            None,
+    # ASSERT: source_matchability_score shape check
+    if source_matchability_score is not None:
+        assert source_matchability_score.shape == (B, 1, Hs, Ws), (
+            f"[DCAT AGG] source_matchability_score shape {source_matchability_score.shape} "
+            f"!= (B={B}, 1, Hs={Hs}, Ws={Ws})"
         )
 
+    # Determine effective aggregation size (handle small feature maps)
+    effective_agg_h = min(agg_size, Hs) if Hs > 0 else 1
+    effective_agg_w = min(agg_size, Ws) if Ws > 0 else 1
+
+    # Fallback to no aggregation if feature map is too small
+    if Hs < effective_agg_h or Ws < effective_agg_w:
+        # Return simple projection without aggregation (identity: Hk=Hs, Wk=Ws)
+        source_proj = source.permute(0, 2, 3, 1)  # [B, Hs, Ws, C]
+        source_proj = k_proj(source_proj)  # [B, Hs, Ws, C]
+        pooled_key_4d = source_proj
+        pooled_value_4d = source_proj  # same projection for value
+        pooled_source_score = source_matchability_score  # [B, 1, Hs, Ws] or None
+        kv_mask = None
+        return pooled_key_4d, pooled_value_4d, pooled_source_score, kv_mask
+
     # Handle non-divisible dimensions with padding
-    pad_h = (effective_agg_h - Hx % effective_agg_h) % effective_agg_h
+    pad_h = (effective_agg_h - Hs % effective_agg_h) % effective_agg_h
     pad_w = (effective_agg_w - Ws % effective_agg_w) % effective_agg_w
 
     source_padded = source
@@ -329,18 +407,18 @@ def _dynamic_aggregate_with_matchability(
         padding=(0, 0),
     )  # [B, C * agg_h * agg_w, Hp//agg_h * Wp//agg_w]
 
-    Hp_out = Hp // effective_agg_h
-    Wp_out = Wp // effective_agg_w
+    Hk = Hp // effective_agg_h
+    Wk = Wp // effective_agg_w
 
     source_unfolded = source_unfolded.reshape(
-        B, C, effective_agg_h, effective_agg_w, Hp_out, Wp_out
-    )  # [B, C, agg_h, agg_w, Hp_out, Wp_out]
+        B, C, effective_agg_h, effective_agg_w, Hk, Wk
+    )  # [B, C, agg_h, agg_w, Hk, Wk]
     source_unfolded = source_unfolded.permute(0, 4, 5, 1, 2, 3).reshape(
-        B * Hp_out * Wp_out, C, effective_agg_h, effective_agg_w
-    )  # [B*Hp_out*Wp_out, C, agg_h, agg_w]
+        B * Hk * Wk, C, effective_agg_h, effective_agg_w
+    )  # [B*Hk*Wk, C, agg_h, agg_w]
 
     # Apply linear projection to source features before aggregation
-    source_proj = k_proj(source_unfolded)  # [B*Hp_out*Wp_out, C, agg_h, agg_w]
+    source_proj = k_proj(source_unfolded)  # [B*Hk*Wk, C, agg_h, agg_w]
 
     # Unfold source matchability scores (RAW scores for max pooling, before softmax)
     if source_score_padded is not None:
@@ -349,85 +427,130 @@ def _dynamic_aggregate_with_matchability(
             kernel_size=(effective_agg_h, effective_agg_w),
             stride=(effective_agg_h, effective_agg_w),
             padding=(0, 0),
-        )  # [B, 1 * agg_h * agg_w, Hp_out * Wp_out]
+        )  # [B, 1 * agg_h * agg_w, Hk * Wk]
         source_score_unfolded_raw = source_score_unfolded_raw.reshape(
-            B, 1, effective_agg_h, effective_agg_w, Hp_out, Wp_out
-        )  # [B, 1, agg_h, agg_w, Hp_out, Wp_out]
+            B, 1, effective_agg_h, effective_agg_w, Hk, Wk
+        )  # [B, 1, agg_h, agg_w, Hk, Wk]
         source_score_unfolded_raw = source_score_unfolded_raw.permute(0, 4, 5, 1, 2, 3).reshape(
-            B * Hp_out * Wp_out, 1, effective_agg_h, effective_agg_w
-        )  # [B*Hp_out*Wp_out, 1, agg_h, agg_w]
+            B * Hk * Wk, 1, effective_agg_h, effective_agg_w
+        )  # [B*Hk*Wk, 1, agg_h, agg_w]
 
         # For softmax weights: use raw scores
         source_score_for_softmax = source_score_unfolded_raw.reshape(
-            B * Hp_out * Wp_out, effective_agg_h * effective_agg_w
-        )  # [B*Hp_out*Wp_out, agg_h*agg_w]
-        agg_weights = F.softmax(source_score_for_softmax, dim=-1)  # [B*Hp_out*Wp_out, agg_h*agg_w]
+            B * Hk * Wk, effective_agg_h * effective_agg_w
+        )  # [B*Hk*Wk, agg_h*agg_w]
+        agg_weights = F.softmax(source_score_for_softmax, dim=-1)  # [B*Hk*Wk, agg_h*agg_w]
         agg_weights = agg_weights.reshape(
-            B * Hp_out * Wp_out, 1, effective_agg_h, effective_agg_w
-        )  # [B*Hp_out*Wp_out, 1, agg_h, agg_w]
+            B * Hk * Wk, 1, effective_agg_h, effective_agg_w
+        )  # [B*Hk*Wk, 1, agg_h, agg_w]
     else:
         source_score_unfolded_raw = None
         agg_weights = None
 
     # Compute softmax weights from source matchability scores
     if agg_weights is not None:
-        # Uniform weights if no matchability scores
         pass  # agg_weights already computed above
     else:
         numel = effective_agg_h * effective_agg_w
         agg_weights = torch.ones_like(source_proj[:, :1, :, :]) / numel
 
     # Weighted aggregation of keys (projected)
-    weighted_keys = source_proj * agg_weights  # [B*Hp_out*Wp_out, C, agg_h, agg_w]
-    pooled_key = weighted_keys.sum(dim=[2, 3])  # [B*Hp_out*Wp_out, C]
+    weighted_keys = source_proj * agg_weights  # [B*Hk*Wk, C, agg_h, agg_w]
+    pooled_key = weighted_keys.sum(dim=[2, 3])  # [B*Hk*Wk, C]
 
-    # Weighted aggregation of values: value is weighted by matchability BEFORE pooling
+    # Weighted aggregation of values
     if source_score_unfolded_raw is not None:
         # Apply value projection first
-        value_proj = v_proj(source_unfolded)  # [B*Hp_out*Wp_out, C, agg_h, agg_w]
+        value_proj = v_proj(source_unfolded)  # [B*Hk*Wk, C, agg_h, agg_w]
 
-        # Reshape source scores for multiplication (use softmax weights)
+        # Reshape source scores for multiplication
         source_scores = agg_weights.reshape(
-            B * Hp_out * Wp_out, effective_agg_h * effective_agg_w
-        )  # [B*Hp_out*Wp_out, agg_h*agg_w]
+            B * Hk * Wk, effective_agg_h * effective_agg_w
+        )  # [B*Hk*Wk, agg_h*agg_w]
 
         # Weight values by source matchability before pooling
         value_proj_flat = value_proj.reshape(
-            B * Hp_out * Wp_out, C, effective_agg_h * effective_agg_w
-        )  # [B*Hp_out*Wp_out, C, agg_h*agg_w]
+            B * Hk * Wk, C, effective_agg_h * effective_agg_w
+        )  # [B*Hk*Wk, C, agg_h*agg_w]
 
-        # Multiply values by matchability scores (weighted value aggregation)
-        weighted_values = value_proj_flat * source_scores.unsqueeze(1)  # [B*Hp_out*Wp_out, C, agg_h*agg_w]
-        pooled_value = weighted_values.sum(dim=-1)  # [B*Hp_out*Wp_out, C]
+        weighted_values = value_proj_flat * source_scores.unsqueeze(1)  # [B*Hk*Wk, C, agg_h*agg_w]
+        pooled_value = weighted_values.sum(dim=-1)  # [B*Hk*Wk, C]
 
-        # Pool source matchability scores using max pooling on RAW scores (aligned with CoMatch)
-        # CoMatch: pooled_source_matchability_score = self.max_pool(source_matchability_score)
-        # We apply max pooling on the raw (pre-softmax) unfolded scores
+        # Pool source matchability scores using max pooling on RAW scores
         source_score_raw_reshaped = source_score_unfolded_raw.reshape(
-            B, Hp_out, Wp_out, effective_agg_h * effective_agg_w
-        )  # [B, Hp_out, Wp_out, agg_h*agg_w]
-        pooled_source_score = source_score_raw_reshaped.max(dim=-1, keepdim=True)[0]  # [B, Hp_out, Wp_out, 1]
-        pooled_source_score = pooled_source_score.reshape(B * Hp_out * Wp_out, 1)  # [B*Hp_out*Wp_out, 1]
+            B, Hk, Wk, effective_agg_h * effective_agg_w
+        )  # [B, Hk, Wk, agg_h*agg_w]
+        pooled_source_score = source_score_raw_reshaped.max(dim=-1, keepdim=True)[0]  # [B, Hk, Wk, 1]
     else:
         pooled_value = pooled_key  # No matchability = uniform aggregation
         pooled_source_score = None
 
-    # Reshape back
-    pooled_key = pooled_key.reshape(B, Hp_out * Wp_out, C)  # [B, Hp_out*Wp_out, C]
-    pooled_value = pooled_value.reshape(B, Hp_out * Wp_out, C)  # [B, Hp_out*Wp_out, C]
+    # Reshape back to 4D: [B, Hk, Wk, C]
+    pooled_key_4d = pooled_key.reshape(B, Hk, Wk, C)
+    pooled_value_4d = pooled_value.reshape(B, Hk, Wk, C)
 
     # If we had padding, crop to original size
+    H_orig, W_orig = int(source_hw[0]), int(source_hw[1])
+    Hk_orig = (H_orig + effective_agg_h - 1) // effective_agg_h  # ceil(H_orig/agg)
+    Wk_orig = (W_orig + effective_agg_w - 1) // effective_agg_w  # ceil(W_orig/agg)
+
     if pad_h > 0 or pad_w > 0:
-        pooled_key = pooled_key[:, : Hx * Wx, :]
-        pooled_value = pooled_value[:, : Hx * Wx, :]
+        pooled_key_4d = pooled_key_4d[:, :Hk_orig, :Wk_orig, :]
+        pooled_value_4d = pooled_value_4d[:, :Hk_orig, :Wk_orig, :]
         if pooled_source_score is not None:
-            pooled_source_score = pooled_source_score[:, : Hx * Wx, :]
+            pooled_source_score = pooled_source_score[:, :Hk_orig, :Wk_orig, :]
 
-    # Reshape pooled_source_score to [B, 1, Hx, Wx] if available
+    # Assertion: verify output shapes
+    assert pooled_key_4d.shape[:3] == (B, Hk_orig, Wk_orig), (
+        f"[DCAT AGG] pooled_key_4d shape {pooled_key_4d.shape[:3]} "
+        f"!= (B={B}, Hk={Hk_orig}, Wk={Wk_orig})"
+    )
+    assert pooled_value_4d.shape[:3] == (B, Hk_orig, Wk_orig), (
+        f"[DCAT AGG] pooled_value_4d shape {pooled_value_4d.shape[:3]} "
+        f"!= (B={B}, Hk={Hk_orig}, Wk={Wk_orig})"
+    )
+
+    # Reshape pooled_source_score to [B, 1, Hk, Wk] if available
     if pooled_source_score is not None:
-        pooled_source_score = pooled_source_score.reshape(B, 1, Hx, Wx)
+        pooled_source_score = pooled_source_score.permute(0, 3, 1, 2)  # [B, 1, Hk, Wk]
 
-    return pooled_key, pooled_value, pooled_source_score
+    # === Generate kv_mask: max pooling of source_mask with same window/stride ===
+    if source_mask is not None:
+        source_mask_padded = source_mask
+        if pad_h > 0 or pad_w > 0:
+            source_mask_padded = F.pad(source_mask.float(), (0, pad_w, 0, pad_h)).bool()
+
+        # Unfold mask with same kernel_size and stride as feature aggregation
+        source_mask_unfolded = F.unfold(
+            source_mask_padded.unsqueeze(1).float(),  # [B, 1, Hp, Wp]
+            kernel_size=(effective_agg_h, effective_agg_w),
+            stride=(effective_agg_h, effective_agg_w),
+            padding=(0, 0),
+        )  # [B, agg_h*agg_w, Hk*Wk]
+
+        source_mask_unfolded = source_mask_unfolded.reshape(
+            B, effective_agg_h, effective_agg_w, Hk, Wk
+        )  # [B, agg_h, agg_w, Hk, Wk]
+        source_mask_unfolded = source_mask_unfolded.permute(0, 3, 4, 1, 2).reshape(
+            B * Hk * Wk, effective_agg_h, effective_agg_w
+        )  # [B*Hk*Wk, agg_h, agg_w]
+
+        # Max pooling: if ANY pixel in the window is valid, the pooled token is valid
+        kv_mask_flat = source_mask_unfolded.max(dim=2)[0].max(dim=1)[0]  # [B*Hk*Wk]
+        kv_mask = kv_mask_flat.reshape(B, Hk, Wk)  # [B, Hk, Wk]
+
+        # Crop to original size if padding was added
+        if pad_h > 0 or pad_w > 0:
+            kv_mask = kv_mask[:, :Hk_orig, :Wk_orig]
+
+        # ASSERT: kv_mask shape must match pooled_key_4d / pooled_value_4d
+        assert kv_mask.shape == (B, Hk_orig, Wk_orig), (
+            f"[DCAT AGG] kv_mask shape {kv_mask.shape} != (B={B}, Hk={Hk_orig}, Wk={Wk_orig})"
+        )
+    else:
+        kv_mask = None
+
+    return pooled_key_4d, pooled_value_4d, pooled_source_score, kv_mask
 
 
 class AG_RoPE_EncoderLayer(nn.Module):
@@ -505,37 +628,27 @@ class AG_RoPE_EncoderLayer(nn.Module):
         B, C, H0, W0 = x.shape
         H1, W1 = source.shape[2], source.shape[3]
 
-        # Handle mask downsampling for cross-resolution
-        if x_mask is not None and source_mask is not None:
-            x_mask_down = self.mask_max_pool(
-                self.mask_max_pool(x_mask.float())
-            ).bool()
-            source_mask_down = self.mask_max_pool(
-                self.mask_max_pool(source_mask.float())
-            ).bool()
-        else:
-            x_mask_down = None
-            source_mask_down = None
-
         # Apply first normalization
         x_norm = self.norm1(x.permute(0, 2, 3, 1))  # [B, H0, W0, C]
         source_norm = self.norm1(source.permute(0, 2, 3, 1))  # [B, H1, W1, C]
 
         if self.use_dcat and source_matchability_score is not None:
-            # === DCAT: Dynamic Covisibility-Aware Aggregation ===
+            # === DCAT: Dynamic Covisibility-Aware Aggregation (native mixed-res) ===
+            # Use ORIGINAL resolution masks (query is at H0xW0, kv is at aggregated HkxWk)
+            # DO NOT downsample x_mask further - it must match query spatial dimensions
+            q_mask_for_dcat = x_mask  # [B, H0, W0] or None
             x_hw = (H0, W0) if x_hw is None else x_hw
             source_hw = (H1, W1) if source_hw is None else source_hw
 
             # Get query projection
             query = self.q_proj(x_norm)  # [B, H0, W0, C]
 
-            # RoPE on query
+            # RoPE on query only (not on aggregated kv)
             if self.rope:
                 query = self.rope_pos_enc(query)
 
-            # Dynamic aggregation with matchability guidance
-            # Projections are applied INSIDE the aggregation function
-            pooled_key, pooled_value, pooled_source_score = _dynamic_aggregate_with_matchability(
+            # Dynamic aggregation: returns TRUE low-res kv (no upsampling back to query resolution)
+            pooled_key_4d, pooled_value_4d, pooled_source_score, kv_mask = _dynamic_aggregate_with_matchability(
                 x,
                 source,
                 x_matchability_score,
@@ -547,53 +660,72 @@ class AG_RoPE_EncoderLayer(nn.Module):
                 self.nhead,
                 self.k_proj,
                 self.v_proj,
+                source_mask=source_mask,  # Pass original source_mask for kv_mask generation
             )
 
-            # Reshape pooled features
-            pooled_key = pooled_key.reshape(B, H0, W0, C)
-            pooled_value = pooled_value.reshape(B, H0, W0, C)
+            Hk = pooled_key_4d.size(1)
+            Wk = pooled_key_4d.size(2)
 
-            # Apply RoPE to pooled key
-            if self.rope:
-                pooled_key = self.rope_pos_enc(pooled_key)
-
-            # Apply value weighting with pooled source matchability (after pooling)
-            # CoMatch: pooled_value = pooled_value * pooled_source_score
-            if pooled_source_score is not None:
-                # pooled_source_score is [B, 1, H0, W0]
-                value_weight = pooled_source_score.permute(0, 2, 3, 1)  # [B, H0, W0, 1]
-                pooled_value = pooled_value * value_weight  # Pure multiplicative weighting
-
-            # Multi-head attention with pooled key/value
-            m = self.attention(
-                query, pooled_key, pooled_value, q_mask=x_mask_down, kv_mask=None
+            # ASSERT: mixed-res attention shapes
+            assert query.shape == (B, H0, W0, C), (
+                f"[DCAT] query shape {query.shape} != ({B}, {H0}, {W0}, {C})"
             )
+            assert pooled_key_4d.shape == (B, Hk, Wk, C), (
+                f"[DCAT] pooled_key shape {pooled_key_4d.shape} != ({B}, {Hk}, {Wk}, {C})"
+            )
+            assert pooled_value_4d.shape == (B, Hk, Wk, C), (
+                f"[DCAT] pooled_value shape {pooled_value_4d.shape} != ({B}, {Hk}, {Wk}, {C})"
+            )
+            # ASSERT: q_mask shape must match query spatial dims
+            assert q_mask_for_dcat is None or q_mask_for_dcat.shape == (B, H0, W0), (
+                f"[DCAT] q_mask shape {q_mask_for_dcat.shape if q_mask_for_dcat is not None else None} "
+                f"!= ({B}, {H0}, {W0})"
+            )
+            # ASSERT: kv_mask shape must match pooled_key_4d spatial dims
+            assert kv_mask is None or kv_mask.shape == (B, Hk, Wk), (
+                f"[DCAT] kv_mask shape {kv_mask.shape if kv_mask is not None else None} "
+                f"!= ({B}, {Hk}, {Wk})"
+            )
+
+            # Multi-head attention with NATIVE mixed resolution (Lq != Lkv)
+            # forward_mixed_res handles [B,Hq,Wq,C] x [B,Hk,Wk,C] -> [B,Hq,Wq,C]
+            m = self.attention.forward_mixed_res(
+                query, pooled_key_4d, pooled_value_4d, q_mask=q_mask_for_dcat, kv_mask=kv_mask
+            )
+
         else:
-            # === Fallback: Simple aggregation without DCAT ===
-            # Average pooling of source for key/value
-            source_pooled = F.avg_pool2d(source, kernel_size=self.agg_size, stride=self.agg_size)
-            Hs_pool, Ws_pool = source_pooled.shape[2], source_pooled.shape[3]
+            # === Fallback: Simple aggregation without DCAT (legacy path) ===
+            # Use downsampled masks since legacy attention expects same-resolution q and kv at 1/32
+            # The legacy self.attention() uses [B,H,W,C] flatten to [B,L,nhead,dim] internally
+            # It does NOT use x_mask_down internally, so these are only for the legacy attention call
+            if x_mask is not None and source_mask is not None:
+                x_mask_down = self.mask_max_pool(
+                    self.mask_max_pool(x_mask.float())
+                ).bool()
+                source_mask_down = self.mask_max_pool(
+                    self.mask_max_pool(source_mask.float())
+                ).bool()
+            else:
+                x_mask_down = None
+                source_mask_down = None
 
-            # Query and key projections
+            # Use same-res attention: query and key/value at SAME resolution (legacy behavior)
+            # key/value at full resolution same as query
             query = self.q_proj(x_norm)  # [B, H0, W0, C]
             key = self.k_proj(source_norm)  # [B, H1, W1, C]
             value = self.v_proj(source_norm)  # [B, H1, W1, C]
 
-            # RoPE
+            # RoPE on query (legacy: same as before)
             if self.rope:
                 query = self.rope_pos_enc(query)
-                key = self.rope_pos_enc(key)
 
-            # Reshape for attention
-            query = query.reshape(B, H0 * W0, C)
-            key = key.reshape(B, H1 * W1, C)
-            value = value.reshape(B, H1 * W1, C)
-
-            # Attention
+            # Legacy attention with same-resolution query/kv (Lq == Lkv)
+            # Uses standard forward (NOT mixed-res)
             m = self.attention(
                 query, key, value, q_mask=x_mask_down, kv_mask=source_mask_down
             )
-            m = m.reshape(B, H0, W0, C)
+            # m is [B, L, H, D], reshape back to [B, H0, W0, C]
+            m = m.reshape(B, H0, W0, self.nhead * self.dim)
 
         # Merge multi-head output
         m = self.merge(m.reshape(B, -1, self.nhead * self.dim))  # [B, H0*W0, C]
@@ -812,6 +944,14 @@ class LocalFeatureTransformer(nn.Module):
                     predictor_idx = i // 2  # 1//2=0, 3//2=1, 5//2=2
                     logit0 = self.predictors[predictor_idx](feat0)  # [B, 1, H0, W0]
                     logit1 = self.predictors[predictor_idx](feat1)  # [B, 1, H1, W1]
+
+                    # ASSERT: predictor output shapes
+                    assert logit0.shape == (B, 1, H0, W0), (
+                        f"[Predictor] logit0 shape {logit0.shape} != ({B}, 1, {H0}, {W0})"
+                    )
+                    assert logit1.shape == (B, 1, H1, W1), (
+                        f"[Predictor] logit1 shape {logit1.shape} != ({B}, 1, {H1}, {W1})"
+                    )
 
                     # Convert to scores for feedback (sigmoid)
                     prev_score0 = torch.sigmoid(logit0)
