@@ -731,12 +731,36 @@ class AG_RoPE_EncoderLayer(nn.Module):
         m = self.merge(m.reshape(B, -1, self.nhead * self.dim))  # [B, H0*W0, C]
         m = m.reshape(B, H0, W0, C).permute(0, 3, 1, 2)  # [B, C, H0, W0]
 
-        # Residual connection
-        out = x + m
+        # ASSERT: message shape must match input x
+        assert m.shape == x.shape, f"[merge] message shape {m.shape} != x shape {x.shape}"
 
-        # Feed-forward network
-        out = self.mlp(out.permute(0, 2, 3, 1))  # [B, H0, W0, C]
-        out = self.norm2(out).permute(0, 3, 1, 2)  # [B, C, H0, W0]
+        # === CoMatch / standard transformer FFN semantics ===
+        # MLP takes concat([x, message]) with 2*d_model input (MLP[0].in_features = d_model*2)
+        # Shape after concat: [B, 2*C, H0, W0] = [B, 512, H0, W0]
+        mlp_in = torch.cat([x, m], dim=1)  # [B, 2*C, H0, W0]
+
+        # ASSERT: concat channel dim must match MLP first layer in_features
+        assert mlp_in.shape[1] == self.mlp[0].in_features, (
+            f"[FFN] mlp_in channel={mlp_in.shape[1]} != MLP in_features={self.mlp[0].in_features}"
+        )
+
+        # Feed-forward network: [B, H0, W0, 2*C] -> [B, H0, W0, C]
+        delta = self.mlp(mlp_in.permute(0, 2, 3, 1))  # [B, H0, W0, 2*C] -> [B, H0, W0, C]
+
+        # ASSERT: MLP output dim must match d_model
+        assert delta.shape[-1] == x.shape[1], (
+            f"[FFN] MLP output dim={delta.shape[-1]} != d_model={x.shape[1]}"
+        )
+
+        # CoMatch semantics: mlp -> norm2 -> residual add
+        # norm2 (LayerNorm) expects [B, H0, W0, C] format (NHWC)
+        delta = self.norm2(delta)  # [B, H0, W0, C]
+
+        # Final residual add: out = x + delta
+        out = x + delta.permute(0, 3, 1, 2).contiguous()  # [B, C, H0, W0]
+
+        # ASSERT: final output shape must match input x
+        assert out.shape == x.shape, f"[final] out shape {out.shape} != x shape {x.shape}"
 
         return out
 
