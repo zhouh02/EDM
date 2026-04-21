@@ -396,29 +396,56 @@ def _dynamic_aggregate_with_matchability(
         if source_matchability_score is not None:
             source_score_padded = F.pad(source_matchability_score, (0, pad_w, 0, pad_h))
 
+    # === Project full source BEFORE unfold (CoMatch semantics) ===
+    # Linear projection operates on channel dim C, not spatial dims
+    source_nhwc = source_padded.permute(0, 2, 3, 1)  # [B, Hs', Ws', C]
+    source_k_full = k_proj(source_nhwc).permute(0, 3, 1, 2)  # [B, C, Hs', Ws']
+    source_v_full = v_proj(source_nhwc).permute(0, 3, 1, 2)  # [B, C, Hs', Ws']
+
+    if pad_h > 0 or pad_w > 0:
+        source_k_full = F.pad(source_k_full, (0, pad_w, 0, pad_h))
+        source_v_full = F.pad(source_v_full, (0, pad_w, 0, pad_h))
+
+    # ASSERT: projected features must have channel dim = d_model
+    assert source_k_full.shape[1] == C, (
+        f"[DCAT AGG] source_k_full channel={source_k_full.shape[1]} != d_model={C}"
+    )
+    assert source_v_full.shape[1] == C, (
+        f"[DCAT AGG] source_v_full channel={source_v_full.shape[1]} != d_model={C}"
+    )
+
     Hp = source_padded.size(2)
     Wp = source_padded.size(3)
-
-    # Unfold source into local windows for aggregation
-    source_unfolded = F.unfold(
-        source_padded,
-        kernel_size=(effective_agg_h, effective_agg_w),
-        stride=(effective_agg_h, effective_agg_w),
-        padding=(0, 0),
-    )  # [B, C * agg_h * agg_w, Hp//agg_h * Wp//agg_w]
-
     Hk = Hp // effective_agg_h
     Wk = Wp // effective_agg_w
 
-    source_unfolded = source_unfolded.reshape(
+    # Unfold KEY features (projected full-image k_proj)
+    source_k_unfolded = F.unfold(
+        source_k_full,
+        kernel_size=(effective_agg_h, effective_agg_w),
+        stride=(effective_agg_h, effective_agg_w),
+        padding=(0, 0),
+    )  # [B, C * agg_h * agg_w, Hk * Wk]
+    source_k_unfolded = source_k_unfolded.reshape(
         B, C, effective_agg_h, effective_agg_w, Hk, Wk
     )  # [B, C, agg_h, agg_w, Hk, Wk]
-    source_unfolded = source_unfolded.permute(0, 4, 5, 1, 2, 3).reshape(
+    source_k_unfolded = source_k_unfolded.permute(0, 4, 5, 1, 2, 3).reshape(
         B * Hk * Wk, C, effective_agg_h, effective_agg_w
     )  # [B*Hk*Wk, C, agg_h, agg_w]
 
-    # Apply linear projection to source features before aggregation
-    source_proj = k_proj(source_unfolded)  # [B*Hk*Wk, C, agg_h, agg_w]
+    # Unfold VALUE features (projected full-image v_proj)
+    source_v_unfolded = F.unfold(
+        source_v_full,
+        kernel_size=(effective_agg_h, effective_agg_w),
+        stride=(effective_agg_h, effective_agg_w),
+        padding=(0, 0),
+    )  # [B, C * agg_h * agg_w, Hk * Wk]
+    source_v_unfolded = source_v_unfolded.reshape(
+        B, C, effective_agg_h, effective_agg_w, Hk, Wk
+    )  # [B, C, agg_h, agg_w, Hk, Wk]
+    source_v_unfolded = source_v_unfolded.permute(0, 4, 5, 1, 2, 3).reshape(
+        B * Hk * Wk, C, effective_agg_h, effective_agg_w
+    )  # [B*Hk*Wk, C, agg_h, agg_w]
 
     # Unfold source matchability scores (RAW scores for max pooling, before softmax)
     if source_score_padded is not None:
@@ -452,16 +479,16 @@ def _dynamic_aggregate_with_matchability(
         pass  # agg_weights already computed above
     else:
         numel = effective_agg_h * effective_agg_w
-        agg_weights = torch.ones_like(source_proj[:, :1, :, :]) / numel
+        agg_weights = torch.ones_like(source_k_unfolded[:, :1, :, :]) / numel
 
-    # Weighted aggregation of keys (projected)
-    weighted_keys = source_proj * agg_weights  # [B*Hk*Wk, C, agg_h, agg_w]
-    pooled_key = weighted_keys.sum(dim=[2, 3])  # [B*Hk*Wk, C]
+    # Weighted aggregation of keys (pre-projected)
+    weighted_keys = source_k_unfolded * agg_weights  # [B*Hk*Wk, C, agg_h, agg_w]
+    pooled_key = weighted_keys.sum(dim=[2, 3])  # [B*Hk*Wk, C]  # [B*Hk*Wk, C]
 
     # Weighted aggregation of values
     if source_score_unfolded_raw is not None:
-        # Apply value projection first
-        value_proj = v_proj(source_unfolded)  # [B*Hk*Wk, C, agg_h, agg_w]
+        # Use pre-projected source_v_unfolded (already projected at full-image level)
+        value_proj = source_v_unfolded  # [B*Hk*Wk, C, agg_h, agg_w]
 
         # Reshape source scores for multiplication
         source_scores = agg_weights.reshape(
