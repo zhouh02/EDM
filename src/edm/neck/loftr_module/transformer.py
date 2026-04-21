@@ -304,6 +304,27 @@ class Attention(Module):
 # Helper Functions for DCAT
 # ============================================
 
+
+def _resize_mask_to_hw(mask, target_hw):
+    """
+    Resize mask to target spatial resolution using adaptive max pooling.
+
+    Args:
+        mask: [B, H, W] bool or float
+        target_hw: (target_h, target_w) tuple
+
+    Returns:
+        mask_resized: [B, target_h, target_w] bool
+    """
+    if mask is None:
+        return None
+    target_h, target_w = target_hw
+    if mask.shape[-2:] == (target_h, target_w):
+        return mask
+    mask_float = mask.float().unsqueeze(1)  # [B, 1, H, W]
+    mask_resized = F.adaptive_max_pool2d(mask_float, (target_h, target_w)).bool().squeeze(1)  # [B, target_h, target_w]
+    return mask_resized
+
 def flatten_to_map(x, hw):
     """Convert [B, HW, C] to [B, C, H, W]"""
     B, HW, C = x.shape
@@ -367,6 +388,13 @@ def _dynamic_aggregate_with_matchability(
         assert source_matchability_score.shape == (B, 1, Hs, Ws), (
             f"[DCAT AGG] source_matchability_score shape {source_matchability_score.shape} "
             f"!= (B={B}, 1, Hs={Hs}, Ws={Ws})"
+        )
+
+    # ASSERT: source_mask must match source feature spatial resolution
+    if source_mask is not None:
+        assert source_mask.shape == (B, Hs, Ws), (
+            f"[DCAT AGG] source_mask shape {source_mask.shape} "
+            f"!= (B={B}, Hs={Hs}, Ws={Ws})"
         )
 
     # Determine effective aggregation size (handle small feature maps)
@@ -661,9 +689,21 @@ class AG_RoPE_EncoderLayer(nn.Module):
 
         if self.use_dcat and source_matchability_score is not None:
             # === DCAT: Dynamic Covisibility-Aware Aggregation (native mixed-res) ===
-            # Use ORIGINAL resolution masks (query is at H0xW0, kv is at aggregated HkxWk)
-            # DO NOT downsample x_mask further - it must match query spatial dimensions
-            q_mask_for_dcat = x_mask  # [B, H0, W0] or None
+            # Resize masks to match feature spatial resolution
+            x_mask_feat = _resize_mask_to_hw(x_mask, (H0, W0))  # [B, H0, W0] or None
+            source_mask_feat = _resize_mask_to_hw(source_mask, (H1, W1))  # [B, H1, W1] or None
+
+            # ASSERT: resized masks must match feature spatial dims
+            assert x_mask_feat is None or x_mask_feat.shape == (B, H0, W0), (
+                f"[DCAT] x_mask_feat shape {x_mask_feat.shape if x_mask_feat is not None else None} "
+                f"!= ({B}, {H0}, {W0})"
+            )
+            assert source_mask_feat is None or source_mask_feat.shape == (B, H1, W1), (
+                f"[DCAT] source_mask_feat shape {source_mask_feat.shape if source_mask_feat is not None else None} "
+                f"!= ({B}, {H1}, {W1})"
+            )
+
+            q_mask_for_dcat = x_mask_feat
             x_hw = (H0, W0) if x_hw is None else x_hw
             source_hw = (H1, W1) if source_hw is None else source_hw
 
@@ -687,7 +727,7 @@ class AG_RoPE_EncoderLayer(nn.Module):
                 self.nhead,
                 self.k_proj,
                 self.v_proj,
-                source_mask=source_mask,  # Pass original source_mask for kv_mask generation
+                source_mask=source_mask_feat,  # Use resized mask aligned with feature resolution
             )
 
             Hk = pooled_key_4d.size(1)
