@@ -303,12 +303,56 @@ class Attention(Module):
                 # kv_mask: [B, Hk, Wk] -> [B, 1, 1, Lk]
                 kvm = kv_mask.reshape(B, 1, 1, Lk)
                 mask = mask.masked_fill(~kvm, float("-inf"))
-            A = torch.softmax(s * QK + mask, dim=3)
+
+            # === Safe softmax: handle all-masked rows ===
+            # A row is invalid if: q_mask is False OR (kv_mask has all-False for this batch)
+            if q_mask is not None:
+                q_valid = q_mask.reshape(B, Lq)  # [B, Lq]
+            else:
+                q_valid = torch.ones(B, Lq, dtype=torch.bool, device=query.device)
+
+            if kv_mask is not None:
+                kv_valid = kv_mask.reshape(B, Lk)  # [B, Lk]
+            else:
+                kv_valid = torch.ones(B, Lk, dtype=torch.bool, device=query.device)
+
+            # Row is valid only if: q is valid AND at least one kv is valid
+            kv_any_valid = kv_valid.any(dim=1, keepdim=True)  # [B, 1]
+            invalid_rows = ~(q_valid & kv_any_valid)  # [B, Lq]
+
+            logits = s * QK + mask  # [B, nhead, Lq, Lk]
+
+            # Step 1: Zero out invalid rows BEFORE softmax to prevent NaN generation
+            if invalid_rows.any():
+                logits = logits.masked_fill(invalid_rows[:, None, :, None], 0.0)
+
+            # Step 2: softmax
+            A = torch.softmax(logits, dim=3)  # [B, nhead, Lq, Lk]
+
+            # Step 3: Zero out invalid rows again as safety net
+            if invalid_rows.any():
+                A = A.masked_fill(invalid_rows[:, None, :, None], 0.0)
+
+            # Step 4: nan_to_num as final guard
+            A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # ASSERT: A must be finite after all guards
+            assert torch.isfinite(A).all(), (
+                f"[mixed_res] A has non-finite values! "
+                f"B={B}, Lq={Lq}, Lk={Lk}, "
+                f"q_valid.sum={q_valid.sum().item()}, kv_any_valid.sum={kv_any_valid.sum().item()}, "
+                f"invalid_rows.sum={invalid_rows.sum().item()}"
+            )
         else:
             A = torch.softmax(s * QK, dim=3)  # [B, nhead, Lq, Lk]
+            assert torch.isfinite(A).all(), "[mixed_res] A has non-finite values!"
 
         # Weighted sum: [B, nhead, Lq, Lk] x [B, Lk, nhead, dim] -> [B, Lq, nhead, dim]
         out = torch.einsum("nhls,nshd->nlhd", A, v)  # [B, Lq, nhead, dim]
+
+        # Guard against any remaining NaN propagating to fine matching
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        assert torch.isfinite(out).all(), "[mixed_res] out has non-finite values!"
 
         return out
 
