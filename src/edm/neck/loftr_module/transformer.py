@@ -271,15 +271,28 @@ class Attention(Module):
 
         # Apply mask before softmax
         if q_mask is not None or kv_mask is not None:
+            # Ensure masks are bool before using ~ operator
+            if q_mask is not None:
+                q_mask = q_mask.bool()
+            if kv_mask is not None:
+                kv_mask = kv_mask.bool()
+
             # ASSERT: mask spatial dims must match corresponding tensor
             if q_mask is not None:
                 assert q_mask.shape == (B, Hq, Wq), (
                     f"[mixed_res] q_mask shape {q_mask.shape} != query spatial ({B}, {Hq}, {Wq})"
                 )
+                assert q_mask.dtype == torch.bool, (
+                    f"[mixed_res] q_mask dtype {q_mask.dtype} != torch.bool"
+                )
             if kv_mask is not None:
                 assert kv_mask.shape == (B, Hk, Wk), (
                     f"[mixed_res] kv_mask shape {kv_mask.shape} != key spatial ({B}, {Hk}, {Wk})"
                 )
+                assert kv_mask.dtype == torch.bool, (
+                    f"[mixed_res] kv_mask dtype {kv_mask.dtype} != torch.bool"
+                )
+
             # Build additive mask: -inf for invalid positions
             mask = torch.zeros(B, 1, Lq, Lk, device=query.device, dtype=query.dtype)
             if q_mask is not None:
@@ -319,6 +332,7 @@ def _resize_mask_to_hw(mask, target_hw):
     if mask is None:
         return None
     target_h, target_w = target_hw
+    mask = mask.bool()  # Ensure bool dtype regardless of input
     if mask.shape[-2:] == (target_h, target_w):
         return mask
     mask_float = mask.float().unsqueeze(1)  # [B, 1, H, W]
@@ -591,16 +605,19 @@ def _dynamic_aggregate_with_matchability(
         )  # [B*Hk*Wk, agg_h, agg_w]
 
         # Max pooling: if ANY pixel in the window is valid, the pooled token is valid
-        kv_mask_flat = source_mask_unfolded.max(dim=2)[0].max(dim=1)[0]  # [B*Hk*Wk]
-        kv_mask = kv_mask_flat.reshape(B, Hk, Wk)  # [B, Hk, Wk]
+        kv_mask_flat = source_mask_unfolded.max(dim=2)[0].max(dim=1)[0]  # [B*Hk*Wk] float
+        kv_mask = kv_mask_flat.reshape(B, Hk, Wk).bool()  # [B, Hk, Wk] bool
 
         # Crop to original size if padding was added
         if pad_h > 0 or pad_w > 0:
             kv_mask = kv_mask[:, :Hk_orig, :Wk_orig]
 
-        # ASSERT: kv_mask shape must match pooled_key_4d / pooled_value_4d
+        # ASSERT: kv_mask shape and dtype
         assert kv_mask.shape == (B, Hk_orig, Wk_orig), (
             f"[DCAT AGG] kv_mask shape {kv_mask.shape} != (B={B}, Hk={Hk_orig}, Wk={Wk_orig})"
+        )
+        assert kv_mask.dtype == torch.bool, (
+            f"[DCAT AGG] kv_mask dtype {kv_mask.dtype} != torch.bool"
         )
     else:
         kv_mask = None
